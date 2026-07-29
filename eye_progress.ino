@@ -25,6 +25,7 @@ const uint8_t IRIS_BASE_B = 200;
 const int CENTER_X = 120;
 const int CENTER_Y = 120;
 const int SCLERA_RADIUS = 120;
+const int SCREEN_DIM = SCLERA_RADIUS * 2; // full display height/width (matches sclera diameter)
 
 const int IRIS_RADIUS = 60;
 const int PUPIL_RADIUS = 30; // Base/resting pupil radius
@@ -100,6 +101,23 @@ float pupilEventDepth = 0.0f; // this event's depth, as a fraction of base radiu
 
 int lastDrawnPupilRadius = -1; // forces first canvas build in setup()
 
+// --- Blink ---
+// A single eyelid (BG_COLOR band) sweeps down from the top of the screen
+// and back up, matching the shape of a real blink: fast, decelerating
+// close; a brief full-closed hold; then a slower, smoother reopen. Real
+// blinks also occasionally come in quick pairs, which is modeled with
+// blinkDoublePending. Eye movement and pupil dynamics are paused for the
+// duration since real eyes don't saccade/react mid-blink.
+bool blinking = false;
+int blinkPhase = 0; // 0 = closing, 1 = closed (hold), 2 = opening
+unsigned long blinkPhaseStart = 0;
+unsigned long blinkCloseDuration = 0;
+unsigned long blinkHoldDuration = 0;
+unsigned long blinkOpenDuration = 0;
+unsigned long nextBlinkTime = 0;
+bool blinkDoublePending = false;
+int lidY = 0; // rows currently covered by the eyelid, from the top: 0 = open, SCREEN_DIM = closed
+
 // Smoothstep-style ease: fast at one end, gentle landing at the other.
 float easeOutQuad(float t) { return 1.0f - (1.0f - t) * (1.0f - t); }
 float easeInOutSmooth(float t) { return t * t * (3.0f - 2.0f * t); }
@@ -160,6 +178,28 @@ void rebuildCanvas(int pupilRadius) {
   canvas.fillCircle(IRIS_RADIUS, IRIS_RADIUS, pupilRadius, PUPIL);
 }
 
+// Redraws exactly one horizontal row of the true eye image (sclera chord,
+// plus the iris/pupil sprite row where it overlaps) at screen row y. Used
+// to reveal blink-lid rows one at a time as the lid retracts, so rows
+// still meant to stay hidden are never touched - and therefore never
+// flash - which is what full-circle repaints were doing before.
+void revealRow(int y) {
+  int dy = y - CENTER_Y;
+  long halfChordSq = (long)SCLERA_RADIUS * SCLERA_RADIUS - (long)dy * dy;
+  if (halfChordSq < 0) return; // outside the circle - already background
+
+  int halfChord = (int)sqrtf((float)halfChordSq);
+  int leftX = CENTER_X - halfChord;
+  int width = halfChord * 2 + 1;
+  tft.drawFastHLine(leftX, y, width, SCLERA);
+
+  int spriteRow = y - lastDrawnTop;
+  if (spriteRow >= 0 && spriteRow < SPRITE_DIM) {
+    uint16_t *rowPixels = canvas.getBuffer() + ((size_t)spriteRow * SPRITE_DIM);
+    tft.drawRGBBitmap(lastDrawnLeft, y, rowPixels, SPRITE_DIM, 1);
+  }
+}
+
 void setup() {
   tft.begin();
   tft.setRotation(0);
@@ -173,6 +213,7 @@ void setup() {
   // First dice-roll for a pupil event happens after one full check interval
   nextPupilCheckTime = millis() + PUPIL_CHECK_INTERVAL;
   nextHippusRetarget = millis() + random(800, 2000);
+  nextBlinkTime = millis() + random(2000, 6000);
 
   // Bake the procedural iris texture once (per-pixel trig is too slow to
   // repeat every frame), then build the first working canvas from it.
@@ -203,10 +244,11 @@ void loop() {
   }
 
   // 2. Advance the eye position glide (only steps every MOVE_INTERVAL).
-  // Just updates currentX/currentY and flags moveDirty; the render tick
-  // (step 4) is solely responsible for actually erasing/redrawing, however
-  // many loop() iterations later that ends up being.
-  if (currentTime - lastMoveTime >= MOVE_INTERVAL) {
+  // Paused while blinking - real eyes don't saccade mid-blink. Just updates
+  // currentX/currentY and flags moveDirty; the render tick (step 4) is
+  // solely responsible for actually erasing/redrawing, however many
+  // loop() iterations later that ends up being.
+  if (!blinking && currentTime - lastMoveTime >= MOVE_INTERVAL) {
     lastMoveTime = currentTime;
 
     if (currentX != targetX || currentY != targetY) {
@@ -240,94 +282,168 @@ void loop() {
     }
   }
 
-  // 4. Render tick: drives hippus + any active constriction event, and the
-  // on-screen redraw. Runs faster than the movement step so everything
-  // reads as smooth even while the eye is holding still.
+  // 3b. Roll for a blink starting (skip if one is already in progress).
+  if (!blinking && currentTime >= nextBlinkTime) {
+    blinking = true;
+    blinkPhase = 0; // closing
+    blinkPhaseStart = currentTime;
+    blinkCloseDuration = random(90, 150);  // fast, real-blink-speed close
+    blinkHoldDuration = random(20, 60);    // brief fully-shut hold
+    blinkOpenDuration = random(150, 260);  // slower reopen
+
+    // Make sure lastDrawnLeft/Top exactly matches the frozen gaze position
+    // before the lid animation starts relying on it for row reveals.
+    lastDrawnLeft = currentX - IRIS_RADIUS;
+    lastDrawnTop = currentY - IRIS_RADIUS;
+    moveDirty = false;
+  }
+
+  // 4. Render tick: drives the blink (if any), otherwise hippus + any
+  // active constriction event, and the on-screen redraw. Runs faster than
+  // the movement step so everything reads as smooth even while the eye is
+  // holding still.
   if (currentTime - lastRenderTime >= RENDER_INTERVAL) {
     lastRenderTime = currentTime;
 
-    // --- Hippus: continuous small drift toward a new random micro-target ---
-    if (currentTime >= nextHippusRetarget) {
-      hippusTarget = ((random(0, 201) / 100.0f) - 1.0f) * HIPPUS_AMPLITUDE; // -amp..+amp
-      nextHippusRetarget = currentTime + random(800, 2000);
-    }
-    hippusCurrent += (hippusTarget - hippusCurrent) * 0.06f; // smooth exponential drift
+    if (blinking) {
+      unsigned long elapsed = currentTime - blinkPhaseStart;
 
-    // --- Constriction/redilation event ---
-    float eventOffset = 0.0f;
-    if (pupilEventActive) {
-      unsigned long elapsed = currentTime - pupilPhaseStart;
-
-      if (pupilConstricting) {
-        if (elapsed >= pupilConstrictDuration) {
-          // Constriction finished; hand off to the slow redilation phase.
-          pupilConstricting = false;
-          pupilPhaseStart = currentTime;
-          eventOffset = -pupilEventDepth;
+      if (blinkPhase == 0) { // closing: sweep the lid down, incrementally
+        int newLidY;
+        if (elapsed >= blinkCloseDuration) {
+          newLidY = SCREEN_DIM;
+          blinkPhase = 1;
+          blinkPhaseStart = currentTime;
         } else {
-          float t = easeOutQuad((float)elapsed / (float)pupilConstrictDuration);
-          eventOffset = -pupilEventDepth * t;
+          float t = easeOutQuad((float)elapsed / (float)blinkCloseDuration);
+          newLidY = (int)(SCREEN_DIM * t + 0.5f);
         }
-      } else {
-        if (elapsed >= pupilDilateDuration) {
-          // Fully back to rest; event over.
-          pupilEventActive = false;
-          eventOffset = 0.0f;
+        if (newLidY > lidY) {
+          tft.fillRect(0, lidY, SCREEN_DIM, newLidY - lidY, BG_COLOR);
+          lidY = newLidY;
+        }
+      } else if (blinkPhase == 1) { // fully closed, brief hold
+        if (elapsed >= blinkHoldDuration) {
+          blinkPhase = 2;
+          blinkPhaseStart = currentTime;
+        }
+      } else { // opening
+        if (elapsed >= blinkOpenDuration) {
+          // Blink finished: reveal any rows still covered, one at a time,
+          // then resync for normal rendering to resume cleanly.
+          if (lidY > 0) {
+            for (int y = 0; y < lidY; y++) revealRow(y);
+          }
+          blinking = false;
+          lidY = 0;
+
+          // Real blinks occasionally come in quick pairs.
+          if (blinkDoublePending) {
+            blinkDoublePending = false;
+            nextBlinkTime = currentTime + random(150, 350);
+          } else {
+            blinkDoublePending = (random(100) < 12); // ~12% chance of a follow-up blink
+            nextBlinkTime = currentTime + random(2000, 6000);
+          }
         } else {
-          float t = easeInOutSmooth((float)elapsed / (float)pupilDilateDuration);
-          eventOffset = -pupilEventDepth * (1.0f - t);
+          float t = (float)elapsed / (float)blinkOpenDuration;
+          float openedFrac = easeInOutSmooth(t);
+          int newLidY = (int)(SCREEN_DIM * (1.0f - openedFrac) + 0.5f);
+
+          if (newLidY < lidY) {
+            // Only reveal the newly-exposed band [newLidY, lidY) with its
+            // true content - rows still above newLidY are left completely
+            // untouched (still solid black), so there's no flash of the
+            // eye becoming briefly visible before being re-covered.
+            for (int y = newLidY; y < lidY; y++) revealRow(y);
+            lidY = newLidY;
+          }
         }
       }
-    }
+    } else {
+      // --- Hippus: continuous small drift toward a new random micro-target ---
+      if (currentTime >= nextHippusRetarget) {
+        hippusTarget = ((random(0, 201) / 100.0f) - 1.0f) * HIPPUS_AMPLITUDE; // -amp..+amp
+        nextHippusRetarget = currentTime + random(800, 2000);
+      }
+      hippusCurrent += (hippusTarget - hippusCurrent) * 0.06f; // smooth exponential drift
 
-    float totalScale = 1.0f + hippusCurrent + eventOffset;
-    int pupilRadius = (int)(PUPIL_RADIUS * totalScale + 0.5f);
-    pupilRadius = constrain(pupilRadius, (int)(PUPIL_RADIUS * 0.5f), (int)(PUPIL_RADIUS * 1.3f));
+      // --- Constriction/redilation event ---
+      float eventOffset = 0.0f;
+      if (pupilEventActive) {
+        unsigned long elapsed = currentTime - pupilPhaseStart;
 
-    bool pupilChanged = (pupilRadius != lastDrawnPupilRadius);
-
-    if (moveDirty || pupilChanged) {
-      if (pupilChanged) {
-        rebuildCanvas(pupilRadius);
-        lastDrawnPupilRadius = pupilRadius;
+        if (pupilConstricting) {
+          if (elapsed >= pupilConstrictDuration) {
+            // Constriction finished; hand off to the slow redilation phase.
+            pupilConstricting = false;
+            pupilPhaseStart = currentTime;
+            eventOffset = -pupilEventDepth;
+          } else {
+            float t = easeOutQuad((float)elapsed / (float)pupilConstrictDuration);
+            eventOffset = -pupilEventDepth * t;
+          }
+        } else {
+          if (elapsed >= pupilDilateDuration) {
+            // Fully back to rest; event over.
+            pupilEventActive = false;
+            eventOffset = 0.0f;
+          } else {
+            float t = easeInOutSmooth((float)elapsed / (float)pupilDilateDuration);
+            eventOffset = -pupilEventDepth * (1.0f - t);
+          }
+        }
       }
 
-      int newLeft = currentX - IRIS_RADIUS;
-      int newTop = currentY - IRIS_RADIUS;
+      float totalScale = 1.0f + hippusCurrent + eventOffset;
+      int pupilRadius = (int)(PUPIL_RADIUS * totalScale + 0.5f);
+      pupilRadius = constrain(pupilRadius, (int)(PUPIL_RADIUS * 0.5f), (int)(PUPIL_RADIUS * 1.3f));
 
-      if (moveDirty) {
-        // Erase relative to lastDrawnLeft/Top - the box actually still on
-        // screen - not a locally re-derived "old" position. That's what
-        // guarantees every pixel exposed since the last real draw gets
-        // cleared, however many (or few) loop() iterations it took to
-        // get here.
-        int dx = newLeft - lastDrawnLeft;
-        int dy = newTop - lastDrawnTop;
+      bool pupilChanged = (pupilRadius != lastDrawnPupilRadius);
 
-        // Only erase the sliver of the OLD box that the NEW box won't
-        // immediately cover, instead of wiping the whole sprite to white
-        // every tick (that full-box wipe is what caused the original flicker).
-        if (dx > 0) {
-          tft.fillRect(lastDrawnLeft, lastDrawnTop, dx, SPRITE_DIM, SCLERA);
-        } else if (dx < 0) {
-          tft.fillRect(lastDrawnLeft + SPRITE_DIM + dx, lastDrawnTop, -dx, SPRITE_DIM, SCLERA);
-        }
-        if (dy > 0) {
-          tft.fillRect(lastDrawnLeft, lastDrawnTop, SPRITE_DIM, dy, SCLERA);
-        } else if (dy < 0) {
-          tft.fillRect(lastDrawnLeft, lastDrawnTop + SPRITE_DIM + dy, SPRITE_DIM, -dy, SCLERA);
+      if (moveDirty || pupilChanged) {
+        if (pupilChanged) {
+          rebuildCanvas(pupilRadius);
+          lastDrawnPupilRadius = pupilRadius;
         }
 
-        moveDirty = false;
+        int newLeft = currentX - IRIS_RADIUS;
+        int newTop = currentY - IRIS_RADIUS;
+
+        if (moveDirty) {
+          // Erase relative to lastDrawnLeft/Top - the box actually still on
+          // screen - not a locally re-derived "old" position. That's what
+          // guarantees every pixel exposed since the last real draw gets
+          // cleared, however many (or few) loop() iterations it took to
+          // get here.
+          int dx = newLeft - lastDrawnLeft;
+          int dy = newTop - lastDrawnTop;
+
+          // Only erase the sliver of the OLD box that the NEW box won't
+          // immediately cover, instead of wiping the whole sprite to white
+          // every tick (that full-box wipe is what caused the original flicker).
+          if (dx > 0) {
+            tft.fillRect(lastDrawnLeft, lastDrawnTop, dx, SPRITE_DIM, SCLERA);
+          } else if (dx < 0) {
+            tft.fillRect(lastDrawnLeft + SPRITE_DIM + dx, lastDrawnTop, -dx, SPRITE_DIM, SCLERA);
+          }
+          if (dy > 0) {
+            tft.fillRect(lastDrawnLeft, lastDrawnTop, SPRITE_DIM, dy, SCLERA);
+          } else if (dy < 0) {
+            tft.fillRect(lastDrawnLeft, lastDrawnTop + SPRITE_DIM + dy, SPRITE_DIM, -dy, SCLERA);
+          }
+
+          moveDirty = false;
+        }
+
+        // Instantly print the pre-baked round eye graphics from the RAM canvas.
+        // When only the pupil changed (no move), this single call overwrites
+        // the whole box in place with no separate erase needed.
+        tft.drawRGBBitmap(newLeft, newTop, canvas.getBuffer(), SPRITE_DIM, SPRITE_DIM);
+
+        lastDrawnLeft = newLeft;
+        lastDrawnTop = newTop;
       }
-
-      // Instantly print the pre-baked round eye graphics from the RAM canvas.
-      // When only the pupil changed (no move), this single call overwrites
-      // the whole box in place with no separate erase needed.
-      tft.drawRGBBitmap(newLeft, newTop, canvas.getBuffer(), SPRITE_DIM, SPRITE_DIM);
-
-      lastDrawnLeft = newLeft;
-      lastDrawnTop = newTop;
     }
   }
 }
