@@ -202,7 +202,7 @@ void revealRow(int y) {
 
 void setup() {
   tft.begin();
-  tft.setRotation(0);
+  tft.setRotation(2);
   tft.fillScreen(BG_COLOR);
 
   // Paint the permanent white eyeball background once
