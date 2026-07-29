@@ -1,4 +1,6 @@
 #include <SPI.h>
+#include <string.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
 
@@ -12,8 +14,13 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 // Define 16-bit 565 colors
 #define BG_COLOR 0x0000
 #define SCLERA   0xFFFF
-#define IRIS     0x001F   // Pure Blue Iris
 #define PUPIL    0x0000
+
+// Base color of the procedural iris texture (a natural iris blue), each
+// channel gets scaled per-pixel by the generated brightness pattern below.
+const uint8_t IRIS_BASE_R = 40;
+const uint8_t IRIS_BASE_G = 95;
+const uint8_t IRIS_BASE_B = 200;
 
 const int CENTER_X = 120;
 const int CENTER_Y = 120;
@@ -32,6 +39,13 @@ const int SPRITE_DIM = IRIS_RADIUS * 2;
 
 // Create an in-RAM canvas (Sprite) exactly the size of the Iris
 GFXcanvas16 canvas(SPRITE_DIM, SPRITE_DIM);
+
+// A second RAM buffer holds the procedurally-generated iris "image":
+// sclera background + a fibrous radial iris pattern, with no pupil punched
+// in. It's computed once in setup() (per-pixel trig is too slow to redo on
+// every pupil-radius change) and then cheaply memcpy'd into canvas each
+// time the pupil resizes, which just punches a fresh hole into the copy.
+GFXcanvas16 irisTexture(SPRITE_DIM, SPRITE_DIM);
 
 int currentX = CENTER_X;
 int currentY = CENTER_Y;
@@ -90,9 +104,59 @@ int lastDrawnPupilRadius = -1; // forces first canvas build in setup()
 float easeOutQuad(float t) { return 1.0f - (1.0f - t) * (1.0f - t); }
 float easeInOutSmooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
+// Shades the iris base color by a brightness factor and packs it to RGB565.
+uint16_t shadeOfIris(float brightness) {
+  int r = constrain((int)(IRIS_BASE_R * brightness), 0, 255);
+  int g = constrain((int)(IRIS_BASE_G * brightness), 0, 255);
+  int b = constrain((int)(IRIS_BASE_B * brightness), 0, 255);
+  return tft.color565(r, g, b);
+}
+
+// Procedurally paints a fibrous iris texture into irisTexture: fine radial
+// streaks (like collagen fibers), a darker limbal ring at the outer edge,
+// and a subtle darker collarette ring near the pupil - the visual cues
+// that read as an "iris image" rather than a flat color fill. Runs once
+// at boot since the per-pixel trig is too slow to repeat every frame.
+void generateIrisTexture() {
+  irisTexture.fillScreen(SCLERA);
+
+  const float spokes = 40.0f; // number of fine fiber streaks around the ring
+
+  for (int y = 0; y < SPRITE_DIM; y++) {
+    for (int x = 0; x < SPRITE_DIM; x++) {
+      float dx = (float)x - IRIS_RADIUS;
+      float dy = (float)y - IRIS_RADIUS;
+      float dist = sqrtf(dx * dx + dy * dy);
+
+      if (dist > IRIS_RADIUS) continue; // leave sclera background as-is
+
+      float angle = atan2f(dy, dx);            // -PI..PI
+      float radialFrac = dist / (float)IRIS_RADIUS; // 0 (pupil edge) .. 1 (outer edge)
+
+      // Two layers of radial fiber streaks at different frequencies.
+      float streak = sinf(angle * spokes + radialFrac * 6.0f);
+      float streak2 = sinf(angle * (spokes * 0.5f) - radialFrac * 3.0f);
+
+      float brightness = 0.65f + 0.20f * streak + 0.15f * streak2;
+
+      // Darker limbal ring where the iris meets the sclera.
+      brightness *= 1.0f - 0.35f * powf(radialFrac, 6.0f);
+
+      // Slightly darker collarette ring near the pupil border.
+      if (radialFrac < 0.35f) {
+        brightness *= 0.85f + 0.15f * (radialFrac / 0.35f);
+      }
+
+      brightness = constrain(brightness, 0.30f, 1.05f);
+
+      irisTexture.drawPixel(x, y, shadeOfIris(brightness));
+    }
+  }
+}
+
 void rebuildCanvas(int pupilRadius) {
-  canvas.fillScreen(SCLERA);
-  canvas.fillCircle(IRIS_RADIUS, IRIS_RADIUS, IRIS_RADIUS, IRIS);
+  // Start from the pre-baked iris texture, then punch the pupil hole.
+  memcpy(canvas.getBuffer(), irisTexture.getBuffer(), (size_t)SPRITE_DIM * SPRITE_DIM * sizeof(uint16_t));
   canvas.fillCircle(IRIS_RADIUS, IRIS_RADIUS, pupilRadius, PUPIL);
 }
 
@@ -110,7 +174,9 @@ void setup() {
   nextPupilCheckTime = millis() + PUPIL_CHECK_INTERVAL;
   nextHippusRetarget = millis() + random(800, 2000);
 
-  // Pre-render the iris and pupil into our hidden RAM buffer
+  // Bake the procedural iris texture once (per-pixel trig is too slow to
+  // repeat every frame), then build the first working canvas from it.
+  generateIrisTexture();
   rebuildCanvas(PUPIL_RADIUS);
   lastDrawnPupilRadius = PUPIL_RADIUS;
 
