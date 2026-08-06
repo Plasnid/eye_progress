@@ -13,7 +13,7 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 
 // Define 16-bit 565 colors
 #define BG_COLOR 0x0000
-#define SCLERA   0xFFFF
+#define SCLERA   0x0000 // black "eye white" background
 #define PUPIL    0x0000
 
 // The iris continuously cycles through the full color spectrum over this
@@ -25,22 +25,28 @@ const int CENTER_Y = 120;
 const int SCLERA_RADIUS = 120;
 const int SCREEN_DIM = SCLERA_RADIUS * 2; // full display height/width (matches sclera diameter)
 
-const int IRIS_RADIUS = 60; // vertical extent of the iris sprite box (also its bounding radius for movement math)
+const int IRIS_RADIUS = 94; // vertical extent of the iris sprite box (also its bounding radius for movement math)
 const int PUPIL_RADIUS = 30; // Base/resting pupil "radius" - now really an animation driver, see PUPIL_SLIT_WIDTH_SCALE
 
-// Cat-eye shaping: the iris itself is a narrower vertical oval (almond-ish)
-// rather than a full circle, and the pupil is a vertical slit within it -
-// widest at the vertical center, tapering to points top and bottom - whose
-// WIDTH is what dilates/constricts, while its HEIGHT stays close to fixed.
-// This reuses the exact same hippus/light-reflex dynamics computed below;
-// only how that value gets turned into a shape has changed.
-const int IRIS_RADIUS_X = (IRIS_RADIUS * 3) / 4;      // narrower left-right (45)
-const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (60)
-const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (51)
+// Cat-eye shaping: the iris is a full circle, but the pupil inside it is a
+// vertical slit - widest at the vertical center, tapering to points top and
+// bottom - whose WIDTH is what dilates/constricts, while its HEIGHT stays
+// close to fixed. This reuses the exact same hippus/light-reflex dynamics
+// computed below; only how that value gets turned into a shape has changed.
+const int IRIS_RADIUS_X = IRIS_RADIUS;                // round iris - same as Y
+const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (94)
+const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (79)
 const float PUPIL_SLIT_WIDTH_SCALE = 0.30f;           // converts the old circular "radius" into a slit half-width
 
-// STRICT HARD LIMITS: Prevents the sprite box from ever bleeding off the edge
-const int MOVE_LIMIT = SCLERA_RADIUS - IRIS_RADIUS - 5;
+// With the enlarged iris, keeping it *fully* inside the round screen at all
+// times leaves very little roaming room (SCLERA_RADIUS - IRIS_RADIUS is
+// small). Trading strict containment for more movement: the iris is
+// allowed to roam far enough that at extreme gaze positions it can extend
+// up to IRIS_CLIP_ALLOWANCE px past the round screen's edge - it'll simply
+// get cut off there (like a real eye partially occluded by the socket when
+// looking hard to one side) rather than staying artificially centered.
+const int IRIS_CLIP_ALLOWANCE = 20;
+const int MOVE_LIMIT = SCLERA_RADIUS - IRIS_RADIUS + IRIS_CLIP_ALLOWANCE;
 const int MIN_ALLOWED_COORD = CENTER_X - MOVE_LIMIT;
 const int MAX_ALLOWED_COORD = CENTER_X + MOVE_LIMIT;
 
@@ -93,7 +99,8 @@ unsigned long lastRenderTime = 0;
 const unsigned long RENDER_INTERVAL = 30; // ~33fps, smooth without flooding SPI
 
 // Hippus (continuous micro-flutter)
-const float HIPPUS_AMPLITUDE = 0.06; // +/-6% of base radius
+// +/-8.4% of base radius (was +/-6% - variability bumped up 40%)
+const float HIPPUS_AMPLITUDE = 0.084;
 float hippusCurrent = 0.0f;          // current offset, as a fraction of base radius
 float hippusTarget = 0.0f;
 unsigned long nextHippusRetarget = 0;
@@ -101,7 +108,7 @@ unsigned long nextHippusRetarget = 0;
 // Light-reflex-style constrict/dilate event
 const unsigned long PUPIL_CHECK_INTERVAL = 20000; // how often we roll the dice
 const int PUPIL_TRIGGER_CHANCE = 30;              // % chance an event fires on each check
-const float PUPIL_MAX_DEPTH = 0.30;               // deepest possible constriction: -30%
+const float PUPIL_MAX_DEPTH = 0.42;               // deepest possible constriction: -42% (was -30%, up 40%)
 unsigned long nextPupilCheckTime = 0;
 bool pupilEventActive = false;
 bool pupilConstricting = false; // true = fast constrict phase, false = slow dilate phase
@@ -141,11 +148,11 @@ float easeInOutSmooth(float t) { return t * t * (3.0f - 2.0f * t); }
 // once at boot since the per-pixel trig is too slow to repeat often; color
 // is layered on separately (and cheaply) at recolor time.
 //
-// The boundary test is elliptical (IRIS_RADIUS_X/Y) rather than circular,
-// which is what gives the iris its narrower, cat-eye almond silhouette;
-// everything else (streaks, limbal ring, collarette) is driven off the
-// same normalized 0..1 "distance to the ellipse edge" so it naturally
-// follows that shape too.
+// The boundary test is expressed in terms of IRIS_RADIUS_X/Y (currently
+// equal, i.e. a plain circle) so the iris shape stays independently
+// adjustable from the pupil's; streaks, limbal ring, and collarette are
+// all driven off the same normalized 0..1 "distance to the edge" so they'd
+// automatically follow suit if that boundary ever became elliptical again.
 void generateIrisBrightnessMap() {
   const float spokes = 40.0f; // number of fine fiber streaks around the ring
 
@@ -173,15 +180,23 @@ void generateIrisBrightnessMap() {
 
       float brightness = 0.65f + 0.20f * streak + 0.15f * streak2;
 
-      // Darker limbal ring where the iris meets the sclera.
-      brightness *= 1.0f - 0.35f * powf(radialFrac, 6.0f);
-
       // Slightly darker collarette ring near the pupil border.
       if (radialFrac < 0.35f) {
         brightness *= 0.85f + 0.15f * (radialFrac / 0.35f);
       }
 
-      brightness = constrain(brightness, 0.30f, 1.05f);
+      // Smoothly fade the outer edge down to full black (rather than a
+      // hard darkened "limbal ring" that still cuts off abruptly against
+      // the sclera) so the iris blends seamlessly into the black
+      // background with no visible boundary.
+      const float FADE_START = 0.65f; // radial fraction where the fade begins
+      if (radialFrac > FADE_START) {
+        float ft = constrain((radialFrac - FADE_START) / (1.0f - FADE_START), 0.0f, 1.0f);
+        float fade = 1.0f - easeInOutSmooth(ft); // 1.0 at FADE_START -> 0.0 at the edge
+        brightness *= fade;
+      }
+
+      brightness = constrain(brightness, 0.0f, 1.05f);
 
       // Scale into 1..255 (0 is reserved to mean "not iris").
       int stored = (int)(brightness * 200.0f + 0.5f);
@@ -272,7 +287,7 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(BG_COLOR);
 
-  // Paint the permanent white eyeball background once
+  // Paint the permanent black eyeball background once
   tft.fillCircle(CENTER_X, CENTER_Y, SCLERA_RADIUS, SCLERA);
 
   randomSeed(analogRead(A0));
@@ -467,7 +482,10 @@ void loop() {
 
       float totalScale = 1.0f + hippusCurrent + eventOffset;
       int pupilRadius = (int)(PUPIL_RADIUS * totalScale + 0.5f);
-      pupilRadius = constrain(pupilRadius, (int)(PUPIL_RADIUS * 0.5f), (int)(PUPIL_RADIUS * 1.3f));
+      // Clamp widened to match: deviation from the 1.0x resting point scaled
+      // up 40% on both ends (was 0.5x-1.3x) so the larger hippus/event
+      // swings above aren't clipped back down.
+      pupilRadius = constrain(pupilRadius, (int)(PUPIL_RADIUS * 0.3f), (int)(PUPIL_RADIUS * 1.42f));
 
       bool pupilChanged = (pupilRadius != lastDrawnPupilRadius);
 
