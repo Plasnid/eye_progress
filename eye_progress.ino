@@ -16,19 +16,28 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 #define SCLERA   0xFFFF
 #define PUPIL    0x0000
 
-// Base color of the procedural iris texture (a natural iris blue), each
-// channel gets scaled per-pixel by the generated brightness pattern below.
-const uint8_t IRIS_BASE_R = 40;
-const uint8_t IRIS_BASE_G = 95;
-const uint8_t IRIS_BASE_B = 200;
+// The iris continuously cycles through the full color spectrum over this
+// period (ms), independent of whatever base color it started at.
+const unsigned long IRIS_HUE_CYCLE_MS = 30000;
 
 const int CENTER_X = 120;
 const int CENTER_Y = 120;
 const int SCLERA_RADIUS = 120;
 const int SCREEN_DIM = SCLERA_RADIUS * 2; // full display height/width (matches sclera diameter)
 
-const int IRIS_RADIUS = 60;
-const int PUPIL_RADIUS = 30; // Base/resting pupil radius
+const int IRIS_RADIUS = 60; // vertical extent of the iris sprite box (also its bounding radius for movement math)
+const int PUPIL_RADIUS = 30; // Base/resting pupil "radius" - now really an animation driver, see PUPIL_SLIT_WIDTH_SCALE
+
+// Cat-eye shaping: the iris itself is a narrower vertical oval (almond-ish)
+// rather than a full circle, and the pupil is a vertical slit within it -
+// widest at the vertical center, tapering to points top and bottom - whose
+// WIDTH is what dilates/constricts, while its HEIGHT stays close to fixed.
+// This reuses the exact same hippus/light-reflex dynamics computed below;
+// only how that value gets turned into a shape has changed.
+const int IRIS_RADIUS_X = (IRIS_RADIUS * 3) / 4;      // narrower left-right (45)
+const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (60)
+const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (51)
+const float PUPIL_SLIT_WIDTH_SCALE = 0.30f;           // converts the old circular "radius" into a slit half-width
 
 // STRICT HARD LIMITS: Prevents the sprite box from ever bleeding off the edge
 const int MOVE_LIMIT = SCLERA_RADIUS - IRIS_RADIUS - 5;
@@ -41,12 +50,14 @@ const int SPRITE_DIM = IRIS_RADIUS * 2;
 // Create an in-RAM canvas (Sprite) exactly the size of the Iris
 GFXcanvas16 canvas(SPRITE_DIM, SPRITE_DIM);
 
-// A second RAM buffer holds the procedurally-generated iris "image":
-// sclera background + a fibrous radial iris pattern, with no pupil punched
-// in. It's computed once in setup() (per-pixel trig is too slow to redo on
-// every pupil-radius change) and then cheaply memcpy'd into canvas each
-// time the pupil resizes, which just punches a fresh hole into the copy.
-GFXcanvas16 irisTexture(SPRITE_DIM, SPRITE_DIM);
+// The iris pattern's *shape* (fibrous streaks, limbal ring, collarette) is
+// baked once at boot into this brightness map, since the per-pixel trig
+// involved is too slow to redo often. 0 means "not iris" (leave as
+// sclera); 1-255 is a scaled brightness. Color is applied separately at
+// canvas-rebuild time by multiplying this brightness against whatever the
+// current hue's base RGB is - that recolor step is cheap (no trig), so it
+// can run every time the hue advances without bogging things down.
+uint8_t irisBrightnessMap[SPRITE_DIM * SPRITE_DIM];
 
 int currentX = CENTER_X;
 int currentY = CENTER_Y;
@@ -100,6 +111,7 @@ unsigned long pupilDilateDuration = 0;
 float pupilEventDepth = 0.0f; // this event's depth, as a fraction of base radius
 
 int lastDrawnPupilRadius = -1; // forces first canvas build in setup()
+int lastDrawnHueDeg = -1;      // forces first canvas build in setup()
 
 // --- Blink ---
 // A single eyelid (BG_COLOR band) sweeps down from the top of the screen
@@ -122,34 +134,38 @@ int lidY = 0; // rows currently covered by the eyelid, from the top: 0 = open, S
 float easeOutQuad(float t) { return 1.0f - (1.0f - t) * (1.0f - t); }
 float easeInOutSmooth(float t) { return t * t * (3.0f - 2.0f * t); }
 
-// Shades the iris base color by a brightness factor and packs it to RGB565.
-uint16_t shadeOfIris(float brightness) {
-  int r = constrain((int)(IRIS_BASE_R * brightness), 0, 255);
-  int g = constrain((int)(IRIS_BASE_G * brightness), 0, 255);
-  int b = constrain((int)(IRIS_BASE_B * brightness), 0, 255);
-  return tft.color565(r, g, b);
-}
-
-// Procedurally paints a fibrous iris texture into irisTexture: fine radial
-// streaks (like collagen fibers), a darker limbal ring at the outer edge,
-// and a subtle darker collarette ring near the pupil - the visual cues
-// that read as an "iris image" rather than a flat color fill. Runs once
-// at boot since the per-pixel trig is too slow to repeat every frame.
-void generateIrisTexture() {
-  irisTexture.fillScreen(SCLERA);
-
+// Procedurally derives the iris's *shape* into irisBrightnessMap: fine
+// radial streaks (like collagen fibers), a darker limbal ring at the outer
+// edge, and a subtle darker collarette ring near the pupil - the visual
+// cues that read as an "iris image" rather than a flat color fill. Runs
+// once at boot since the per-pixel trig is too slow to repeat often; color
+// is layered on separately (and cheaply) at recolor time.
+//
+// The boundary test is elliptical (IRIS_RADIUS_X/Y) rather than circular,
+// which is what gives the iris its narrower, cat-eye almond silhouette;
+// everything else (streaks, limbal ring, collarette) is driven off the
+// same normalized 0..1 "distance to the ellipse edge" so it naturally
+// follows that shape too.
+void generateIrisBrightnessMap() {
   const float spokes = 40.0f; // number of fine fiber streaks around the ring
 
   for (int y = 0; y < SPRITE_DIM; y++) {
     for (int x = 0; x < SPRITE_DIM; x++) {
+      int idx = y * SPRITE_DIM + x;
+
       float dx = (float)x - IRIS_RADIUS;
       float dy = (float)y - IRIS_RADIUS;
-      float dist = sqrtf(dx * dx + dy * dy);
+      float ndx = dx / (float)IRIS_RADIUS_X;
+      float ndy = dy / (float)IRIS_RADIUS_Y;
+      float dist = sqrtf(ndx * ndx + ndy * ndy); // 0 at center, 1.0 at the ellipse edge
 
-      if (dist > IRIS_RADIUS) continue; // leave sclera background as-is
+      if (dist > 1.0f) {
+        irisBrightnessMap[idx] = 0; // not iris - stays sclera
+        continue;
+      }
 
-      float angle = atan2f(dy, dx);            // -PI..PI
-      float radialFrac = dist / (float)IRIS_RADIUS; // 0 (pupil edge) .. 1 (outer edge)
+      float angle = atan2f(ndy, ndx);  // pseudo-angle in normalized ellipse space
+      float radialFrac = dist;         // already 0 (center) .. 1 (outer edge)
 
       // Two layers of radial fiber streaks at different frequencies.
       float streak = sinf(angle * spokes + radialFrac * 6.0f);
@@ -167,15 +183,66 @@ void generateIrisTexture() {
 
       brightness = constrain(brightness, 0.30f, 1.05f);
 
-      irisTexture.drawPixel(x, y, shadeOfIris(brightness));
+      // Scale into 1..255 (0 is reserved to mean "not iris").
+      int stored = (int)(brightness * 200.0f + 0.5f);
+      irisBrightnessMap[idx] = (uint8_t)constrain(stored, 1, 255);
     }
   }
 }
 
-void rebuildCanvas(int pupilRadius) {
-  // Start from the pre-baked iris texture, then punch the pupil hole.
-  memcpy(canvas.getBuffer(), irisTexture.getBuffer(), (size_t)SPRITE_DIM * SPRITE_DIM * sizeof(uint16_t));
-  canvas.fillCircle(IRIS_RADIUS, IRIS_RADIUS, pupilRadius, PUPIL);
+// Full-saturation, full-value HSV -> RGB, i.e. a pure spectrum color for a
+// given hue angle (0-360 degrees).
+void hueToRGB(float hueDeg, uint8_t &r, uint8_t &g, uint8_t &b) {
+  float h = hueDeg / 60.0f;
+  int hi = ((int)h) % 6;
+  float f = h - (int)h;
+  uint8_t q = (uint8_t)(255 * (1.0f - f));
+  uint8_t t = (uint8_t)(255 * f);
+  switch (hi) {
+    case 0: r = 255; g = t;   b = 0;   break;
+    case 1: r = q;   g = 255; b = 0;   break;
+    case 2: r = 0;   g = 255; b = t;   break;
+    case 3: r = 0;   g = q;   b = 255; break;
+    case 4: r = t;   g = 0;   b = 255; break;
+    default: r = 255; g = 0;  b = q;   break; // case 5
+  }
+}
+
+// Draws the pupil as a vertical cat-eye slit centered in the canvas: an
+// ellipse-profile shape that's widest at its vertical midpoint and tapers
+// to a point at top and bottom, with a fixed-ish half-height and an
+// animated half-width (narrow at rest/bright, widening toward round in
+// the "dilated" state - exactly like a real cat pupil).
+void fillPupilSlit(int halfWidth) {
+  if (halfWidth < 1) halfWidth = 1;
+
+  for (int dy = -PUPIL_SLIT_HALF_HEIGHT; dy <= PUPIL_SLIT_HALF_HEIGHT; dy++) {
+    float t = (float)dy / (float)PUPIL_SLIT_HALF_HEIGHT;
+    float widthFrac = sqrtf(constrain(1.0f - t * t, 0.0f, 1.0f)); // ellipse cross-section
+    int w = (int)(halfWidth * widthFrac + 0.5f);
+    if (w < 1) continue; // taper to a point at the very top/bottom - leave those rows untouched
+
+    int y = IRIS_RADIUS + dy;
+    canvas.drawFastHLine(IRIS_RADIUS - w, y, w * 2 + 1, PUPIL);
+  }
+}
+
+void rebuildCanvas(int pupilRadius, uint8_t baseR, uint8_t baseG, uint8_t baseB) {
+  uint16_t *buf = canvas.getBuffer();
+  for (int i = 0; i < SPRITE_DIM * SPRITE_DIM; i++) {
+    uint8_t raw = irisBrightnessMap[i];
+    if (raw == 0) {
+      buf[i] = SCLERA;
+    } else {
+      float brightness = raw / 200.0f;
+      int r = constrain((int)(baseR * brightness), 0, 255);
+      int g = constrain((int)(baseG * brightness), 0, 255);
+      int b = constrain((int)(baseB * brightness), 0, 255);
+      buf[i] = tft.color565(r, g, b);
+    }
+  }
+  int slitHalfWidth = (int)(pupilRadius * PUPIL_SLIT_WIDTH_SCALE + 0.5f);
+  fillPupilSlit(slitHalfWidth);
 }
 
 // Redraws exactly one horizontal row of the true eye image (sclera chord,
@@ -202,7 +269,7 @@ void revealRow(int y) {
 
 void setup() {
   tft.begin();
-  tft.setRotation(2);
+  tft.setRotation(0);
   tft.fillScreen(BG_COLOR);
 
   // Paint the permanent white eyeball background once
@@ -215,11 +282,14 @@ void setup() {
   nextHippusRetarget = millis() + random(800, 2000);
   nextBlinkTime = millis() + random(2000, 6000);
 
-  // Bake the procedural iris texture once (per-pixel trig is too slow to
-  // repeat every frame), then build the first working canvas from it.
-  generateIrisTexture();
-  rebuildCanvas(PUPIL_RADIUS);
+  // Bake the iris shape once (per-pixel trig is too slow to repeat every
+  // frame), then build the first working canvas at hue 0 (red).
+  generateIrisBrightnessMap();
+  uint8_t r0, g0, b0;
+  hueToRGB(0.0f, r0, g0, b0);
+  rebuildCanvas(PUPIL_RADIUS, r0, g0, b0);
   lastDrawnPupilRadius = PUPIL_RADIUS;
+  lastDrawnHueDeg = 0;
 
   // Push the initial center eye graphic from RAM to the physical screen
   tft.drawRGBBitmap(currentX - IRIS_RADIUS, currentY - IRIS_RADIUS, canvas.getBuffer(), SPRITE_DIM, SPRITE_DIM);
@@ -401,10 +471,25 @@ void loop() {
 
       bool pupilChanged = (pupilRadius != lastDrawnPupilRadius);
 
-      if (moveDirty || pupilChanged) {
-        if (pupilChanged) {
-          rebuildCanvas(pupilRadius);
+      // --- Continuous full-spectrum hue rotation, on a fixed period tied
+      // directly to millis() so it never drifts. Only compared at whole-
+      // degree resolution so the (cheap, but not free) canvas recolor only
+      // runs when there's an actual visible change - naturally throttles
+      // to roughly every 80ms at a 30s cycle.
+      float hueDeg = fmodf((float)(currentTime % IRIS_HUE_CYCLE_MS), (float)IRIS_HUE_CYCLE_MS)
+                     / (float)IRIS_HUE_CYCLE_MS * 360.0f;
+      int hueDegInt = (int)hueDeg;
+      bool hueChanged = (hueDegInt != lastDrawnHueDeg);
+
+      bool canvasDirty = pupilChanged || hueChanged;
+
+      if (moveDirty || canvasDirty) {
+        if (canvasDirty) {
+          uint8_t baseR, baseG, baseB;
+          hueToRGB(hueDeg, baseR, baseG, baseB);
+          rebuildCanvas(pupilRadius, baseR, baseG, baseB);
           lastDrawnPupilRadius = pupilRadius;
+          lastDrawnHueDeg = hueDegInt;
         }
 
         int newLeft = currentX - IRIS_RADIUS;
