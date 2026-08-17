@@ -4,10 +4,14 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
 
-// Custom Pin Definitions (Locked)
-#define TFT_CS     9
-#define TFT_DC     5
-#define TFT_RST    6
+// Pin Definitions for Adafruit QT Py ESP32-S3.
+// SCK/MOSI aren't set explicitly - Adafruit_GC9A01A drives the display over
+// the board's default hardware SPI bus, which the QT Py ESP32-S3's Arduino
+// variant already maps to its broken-out SCK/MOSI pins. See the separate
+// pin connection listing for the full wiring table.
+#define TFT_CS     18 // A0
+#define TFT_DC     17 // A1
+#define TFT_RST    9  // A2
 
 Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 
