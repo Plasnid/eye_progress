@@ -1,19 +1,18 @@
-#include <SPI.h>
-#include <string.h>
 #include <math.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_GC9A01A.h>
+#include <Arduino_GFX_Library.h>
 
 // Pin Definitions for Adafruit QT Py ESP32-S3.
-// SCK/MOSI aren't set explicitly - Adafruit_GC9A01A drives the display over
-// the board's default hardware SPI bus, which the QT Py ESP32-S3's Arduino
-// variant already maps to its broken-out SCK/MOSI pins. See the separate
+// SCK/MOSI/MISO are NOT redefined here - they come from the board's own
+// Arduino core variant (GPIO36/35/37), which Arduino_ESP32SPI picks up
+// automatically via the built-in SCK/MOSI/MISO constants. See the separate
 // pin connection listing for the full wiring table.
 #define TFT_CS     18 // A0
 #define TFT_DC     17 // A1
 #define TFT_RST    9  // A2
 
-Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
+// Create the SPI bus instance and the GC9D01 display panel instance
+Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, SCK, MOSI, MISO);
+Arduino_GFX *display = new Arduino_GC9D01(bus, TFT_RST, 0 /* rotation */, false /* IPS */);
 
 // Define 16-bit 565 colors
 #define BG_COLOR 0x0000
@@ -24,13 +23,14 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 // period (ms), independent of whatever base color it started at.
 const unsigned long IRIS_HUE_CYCLE_MS = 30000;
 
-const int CENTER_X = 120;
-const int CENTER_Y = 120;
-const int SCLERA_RADIUS = 120;
+// 160x160 round display - matches the GC9D01's native resolution.
+const int CENTER_X = 80;
+const int CENTER_Y = 80;
+const int SCLERA_RADIUS = 80;
 const int SCREEN_DIM = SCLERA_RADIUS * 2; // full display height/width (matches sclera diameter)
 
-const int IRIS_RADIUS = 94; // vertical extent of the iris sprite box (also its bounding radius for movement math)
-const int PUPIL_RADIUS = 30; // Base/resting pupil "radius" - now really an animation driver, see PUPIL_SLIT_WIDTH_SCALE
+const int IRIS_RADIUS = 63; // vertical extent of the iris sprite box (also its bounding radius for movement math)
+const int PUPIL_RADIUS = 20; // Base/resting pupil "radius" - now really an animation driver, see PUPIL_SLIT_WIDTH_SCALE
 
 // Cat-eye shaping: the iris is a full circle, but the pupil inside it is a
 // vertical slit - widest at the vertical center, tapering to points top and
@@ -38,8 +38,8 @@ const int PUPIL_RADIUS = 30; // Base/resting pupil "radius" - now really an anim
 // close to fixed. This reuses the exact same hippus/light-reflex dynamics
 // computed below; only how that value gets turned into a shape has changed.
 const int IRIS_RADIUS_X = IRIS_RADIUS;                // round iris - same as Y
-const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (94)
-const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (79)
+const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (63)
+const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (53)
 const float PUPIL_SLIT_WIDTH_SCALE = 0.30f;           // converts the old circular "radius" into a slit half-width
 
 // With the enlarged iris, keeping it *fully* inside the round screen at all
@@ -49,7 +49,7 @@ const float PUPIL_SLIT_WIDTH_SCALE = 0.30f;           // converts the old circul
 // up to IRIS_CLIP_ALLOWANCE px past the round screen's edge - it'll simply
 // get cut off there (like a real eye partially occluded by the socket when
 // looking hard to one side) rather than staying artificially centered.
-const int IRIS_CLIP_ALLOWANCE = 20;
+const int IRIS_CLIP_ALLOWANCE = 13;
 const int MOVE_LIMIT = SCLERA_RADIUS - IRIS_RADIUS + IRIS_CLIP_ALLOWANCE;
 const int MIN_ALLOWED_COORD = CENTER_X - MOVE_LIMIT;
 const int MAX_ALLOWED_COORD = CENTER_X + MOVE_LIMIT;
@@ -57,8 +57,11 @@ const int MAX_ALLOWED_COORD = CENTER_X + MOVE_LIMIT;
 // Calculate bounding box size for the moving eye assembly
 const int SPRITE_DIM = IRIS_RADIUS * 2;
 
-// Create an in-RAM canvas (Sprite) exactly the size of the Iris
-GFXcanvas16 canvas(SPRITE_DIM, SPRITE_DIM);
+// In-RAM offscreen buffer (Sprite) exactly the size of the iris, drawn into
+// directly as a plain RGB565 pixel array and blitted to the display with
+// draw16bitRGBBitmap(). (Arduino_GFX doesn't have a GFXcanvas16-style helper
+// class for this, so it's just a raw buffer we index by hand.)
+uint16_t canvasBuffer[SPRITE_DIM * SPRITE_DIM];
 
 // The iris pattern's *shape* (fibrous streaks, limbal ring, collarette) is
 // baked once at boot into this brightness map, since the per-pixel trig
@@ -227,11 +230,12 @@ void hueToRGB(float hueDeg, uint8_t &r, uint8_t &g, uint8_t &b) {
   }
 }
 
-// Draws the pupil as a vertical cat-eye slit centered in the canvas: an
-// ellipse-profile shape that's widest at its vertical midpoint and tapers
-// to a point at top and bottom, with a fixed-ish half-height and an
-// animated half-width (narrow at rest/bright, widening toward round in
-// the "dilated" state - exactly like a real cat pupil).
+// Draws the pupil as a vertical cat-eye slit centered in the canvas buffer:
+// an ellipse-profile shape that's widest at its vertical midpoint and
+// tapers to a point at top and bottom, with a fixed-ish half-height and an
+// animated half-width (narrow at rest/bright, widening toward round in the
+// "dilated" state - exactly like a real cat pupil). Writes straight into
+// canvasBuffer since Arduino_GFX has no small-canvas drawing helper here.
 void fillPupilSlit(int halfWidth) {
   if (halfWidth < 1) halfWidth = 1;
 
@@ -242,22 +246,25 @@ void fillPupilSlit(int halfWidth) {
     if (w < 1) continue; // taper to a point at the very top/bottom - leave those rows untouched
 
     int y = IRIS_RADIUS + dy;
-    canvas.drawFastHLine(IRIS_RADIUS - w, y, w * 2 + 1, PUPIL);
+    int xStart = IRIS_RADIUS - w;
+    uint16_t *row = canvasBuffer + (size_t)y * SPRITE_DIM;
+    for (int i = 0, span = w * 2 + 1; i < span; i++) {
+      row[xStart + i] = PUPIL;
+    }
   }
 }
 
 void rebuildCanvas(int pupilRadius, uint8_t baseR, uint8_t baseG, uint8_t baseB) {
-  uint16_t *buf = canvas.getBuffer();
   for (int i = 0; i < SPRITE_DIM * SPRITE_DIM; i++) {
     uint8_t raw = irisBrightnessMap[i];
     if (raw == 0) {
-      buf[i] = SCLERA;
+      canvasBuffer[i] = SCLERA;
     } else {
       float brightness = raw / 200.0f;
       int r = constrain((int)(baseR * brightness), 0, 255);
       int g = constrain((int)(baseG * brightness), 0, 255);
       int b = constrain((int)(baseB * brightness), 0, 255);
-      buf[i] = tft.color565(r, g, b);
+      canvasBuffer[i] = display->color565(r, g, b);
     }
   }
   int slitHalfWidth = (int)(pupilRadius * PUPIL_SLIT_WIDTH_SCALE + 0.5f);
@@ -277,24 +284,28 @@ void revealRow(int y) {
   int halfChord = (int)sqrtf((float)halfChordSq);
   int leftX = CENTER_X - halfChord;
   int width = halfChord * 2 + 1;
-  tft.drawFastHLine(leftX, y, width, SCLERA);
+  display->drawFastHLine(leftX, y, width, SCLERA);
 
   int spriteRow = y - lastDrawnTop;
   if (spriteRow >= 0 && spriteRow < SPRITE_DIM) {
-    uint16_t *rowPixels = canvas.getBuffer() + ((size_t)spriteRow * SPRITE_DIM);
-    tft.drawRGBBitmap(lastDrawnLeft, y, rowPixels, SPRITE_DIM, 1);
+    uint16_t *rowPixels = canvasBuffer + ((size_t)spriteRow * SPRITE_DIM);
+    display->draw16bitRGBBitmap(lastDrawnLeft, y, rowPixels, SPRITE_DIM, 1);
   }
 }
 
 void setup() {
-  tft.begin();
-  tft.setRotation(0);
-  tft.fillScreen(BG_COLOR);
+  // Arduino_TFT::begin() calls the bus's begin() internally and applies
+  // the rotation passed to the Arduino_GC9D01 constructor above, so there's
+  // no separate bus->begin()/setRotation() call needed here.
+  display->begin();
+  display->fillScreen(BG_COLOR);
 
   // Paint the permanent black eyeball background once
-  tft.fillCircle(CENTER_X, CENTER_Y, SCLERA_RADIUS, SCLERA);
+  display->fillCircle(CENTER_X, CENTER_Y, SCLERA_RADIUS, SCLERA);
 
-  randomSeed(analogRead(A0));
+  // A3 is used (rather than A0) since A0 is GPIO18 - the same pin as
+  // TFT_CS above; reading it here would collide with the display wiring.
+  randomSeed(analogRead(A3));
 
   // First dice-roll for a pupil event happens after one full check interval
   nextPupilCheckTime = millis() + PUPIL_CHECK_INTERVAL;
@@ -311,7 +322,7 @@ void setup() {
   lastDrawnHueDeg = 0;
 
   // Push the initial center eye graphic from RAM to the physical screen
-  tft.drawRGBBitmap(currentX - IRIS_RADIUS, currentY - IRIS_RADIUS, canvas.getBuffer(), SPRITE_DIM, SPRITE_DIM);
+  display->draw16bitRGBBitmap(currentX - IRIS_RADIUS, currentY - IRIS_RADIUS, canvasBuffer, SPRITE_DIM, SPRITE_DIM);
 }
 
 void loop() {
@@ -408,7 +419,7 @@ void loop() {
           newLidY = (int)(SCREEN_DIM * t + 0.5f);
         }
         if (newLidY > lidY) {
-          tft.fillRect(0, lidY, SCREEN_DIM, newLidY - lidY, BG_COLOR);
+          display->fillRect(0, lidY, SCREEN_DIM, newLidY - lidY, BG_COLOR);
           lidY = newLidY;
         }
       } else if (blinkPhase == 1) { // fully closed, brief hold
@@ -530,14 +541,14 @@ void loop() {
           // immediately cover, instead of wiping the whole sprite to white
           // every tick (that full-box wipe is what caused the original flicker).
           if (dx > 0) {
-            tft.fillRect(lastDrawnLeft, lastDrawnTop, dx, SPRITE_DIM, SCLERA);
+            display->fillRect(lastDrawnLeft, lastDrawnTop, dx, SPRITE_DIM, SCLERA);
           } else if (dx < 0) {
-            tft.fillRect(lastDrawnLeft + SPRITE_DIM + dx, lastDrawnTop, -dx, SPRITE_DIM, SCLERA);
+            display->fillRect(lastDrawnLeft + SPRITE_DIM + dx, lastDrawnTop, -dx, SPRITE_DIM, SCLERA);
           }
           if (dy > 0) {
-            tft.fillRect(lastDrawnLeft, lastDrawnTop, SPRITE_DIM, dy, SCLERA);
+            display->fillRect(lastDrawnLeft, lastDrawnTop, SPRITE_DIM, dy, SCLERA);
           } else if (dy < 0) {
-            tft.fillRect(lastDrawnLeft, lastDrawnTop + SPRITE_DIM + dy, SPRITE_DIM, -dy, SCLERA);
+            display->fillRect(lastDrawnLeft, lastDrawnTop + SPRITE_DIM + dy, SPRITE_DIM, -dy, SCLERA);
           }
 
           moveDirty = false;
@@ -546,7 +557,7 @@ void loop() {
         // Instantly print the pre-baked round eye graphics from the RAM canvas.
         // When only the pupil changed (no move), this single call overwrites
         // the whole box in place with no separate erase needed.
-        tft.drawRGBBitmap(newLeft, newTop, canvas.getBuffer(), SPRITE_DIM, SPRITE_DIM);
+        display->draw16bitRGBBitmap(newLeft, newTop, canvasBuffer, SPRITE_DIM, SPRITE_DIM);
 
         lastDrawnLeft = newLeft;
         lastDrawnTop = newTop;
