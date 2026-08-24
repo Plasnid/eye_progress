@@ -12,7 +12,7 @@
 
 // Create the SPI bus instance and the GC9D01 display panel instance
 Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, SCK, MOSI, MISO);
-Arduino_GFX *display = new Arduino_GC9D01(bus, TFT_RST, 0 /* rotation */, false /* IPS */);
+Arduino_GFX *display = new Arduino_GC9D01(bus, TFT_RST, 3 /* rotation */, false /* IPS */);
 
 // Define 16-bit 565 colors
 #define BG_COLOR 0x0000
@@ -41,6 +41,17 @@ const int IRIS_RADIUS_X = IRIS_RADIUS;                // round iris - same as Y
 const int IRIS_RADIUS_Y = IRIS_RADIUS;                // full extent top-to-bottom (63)
 const int PUPIL_SLIT_HALF_HEIGHT = (IRIS_RADIUS_Y * 85) / 100; // slit's fixed long axis (53)
 const float PUPIL_SLIT_WIDTH_SCALE = 0.30f;           // converts the old circular "radius" into a slit half-width
+
+// Tilts the whole eye (iris fiber texture + pupil slit) clockwise by this
+// many degrees. The sclera is a plain circle so it needs no change - only
+// features with their own orientation (the slit, the streak pattern) do.
+// Not a multiple of 90 degrees, so this can't be done via the display's
+// setRotation()/constructor rotation argument (which only supports 0/90/
+// 180/270); it's baked directly into the per-pixel iris/pupil math instead.
+const float EYE_ROTATION_DEG = 22.0f;
+float eyeRotTheta = 0.0f; // EYE_ROTATION_DEG in radians, set once in setup()
+float eyeRotCos = 1.0f;
+float eyeRotSin = 0.0f;
 
 // With the enlarged iris, keeping it *fully* inside the round screen at all
 // times leaves very little roaming room (SCLERA_RADIUS - IRIS_RADIUS is
@@ -178,7 +189,9 @@ void generateIrisBrightnessMap() {
         continue;
       }
 
-      float angle = atan2f(ndy, ndx);  // pseudo-angle in normalized ellipse space
+      // Subtracting eyeRotTheta here rotates the whole streak pattern
+      // clockwise by EYE_ROTATION_DEG along with the pupil slit below.
+      float angle = atan2f(ndy, ndx) - eyeRotTheta; // pseudo-angle in normalized ellipse space
       float radialFrac = dist;         // already 0 (center) .. 1 (outer edge)
 
       // Two layers of radial fiber streaks at different frequencies.
@@ -230,26 +243,44 @@ void hueToRGB(float hueDeg, uint8_t &r, uint8_t &g, uint8_t &b) {
   }
 }
 
-// Draws the pupil as a vertical cat-eye slit centered in the canvas buffer:
-// an ellipse-profile shape that's widest at its vertical midpoint and
-// tapers to a point at top and bottom, with a fixed-ish half-height and an
-// animated half-width (narrow at rest/bright, widening toward round in the
-// "dilated" state - exactly like a real cat pupil). Writes straight into
-// canvasBuffer since Arduino_GFX has no small-canvas drawing helper here.
+// Draws the pupil as a cat-eye slit centered in the canvas buffer, tilted
+// EYE_ROTATION_DEG clockwise from vertical: an ellipse-profile shape that's
+// widest at its midline and tapers to a point at each end, with a fixed-ish
+// half-height (along its tilted axis) and an animated half-width (narrow at
+// rest/bright, widening toward round in the "dilated" state - exactly like
+// a real cat pupil). Writes straight into canvasBuffer since Arduino_GFX has
+// no small-canvas drawing helper here.
+//
+// Rotation is applied by testing each candidate pixel's position after
+// rotating it *backward* by EYE_ROTATION_DEG, against the plain untilted
+// slit definition - equivalent to stamping the untilted shape and then
+// rotating the whole stamp clockwise by EYE_ROTATION_DEG. Because that
+// turns this into a per-pixel test rather than a per-row symmetric span,
+// it walks a square bounding box (sized to the slit's half-height, which
+// safely contains it at any rotation) instead of the old direct row fill.
 void fillPupilSlit(int halfWidth) {
   if (halfWidth < 1) halfWidth = 1;
 
   for (int dy = -PUPIL_SLIT_HALF_HEIGHT; dy <= PUPIL_SLIT_HALF_HEIGHT; dy++) {
-    float t = (float)dy / (float)PUPIL_SLIT_HALF_HEIGHT;
-    float widthFrac = sqrtf(constrain(1.0f - t * t, 0.0f, 1.0f)); // ellipse cross-section
-    int w = (int)(halfWidth * widthFrac + 0.5f);
-    if (w < 1) continue; // taper to a point at the very top/bottom - leave those rows untouched
-
     int y = IRIS_RADIUS + dy;
-    int xStart = IRIS_RADIUS - w;
     uint16_t *row = canvasBuffer + (size_t)y * SPRITE_DIM;
-    for (int i = 0, span = w * 2 + 1; i < span; i++) {
-      row[xStart + i] = PUPIL;
+
+    for (int dx = -PUPIL_SLIT_HALF_HEIGHT; dx <= PUPIL_SLIT_HALF_HEIGHT; dx++) {
+      // Undo the tilt to get this pixel's position in the slit's own,
+      // untilted coordinate space.
+      float ux = dx * eyeRotCos + dy * eyeRotSin;
+      float uy = -dx * eyeRotSin + dy * eyeRotCos;
+
+      float t = uy / (float)PUPIL_SLIT_HALF_HEIGHT;
+      if (t < -1.0f || t > 1.0f) continue;
+      float widthFrac = sqrtf(constrain(1.0f - t * t, 0.0f, 1.0f)); // ellipse cross-section
+      float w = halfWidth * widthFrac;
+      if (w < 0.5f) continue; // taper to a point at each end
+
+      if (fabsf(ux) <= w) {
+        int x = IRIS_RADIUS + dx;
+        row[x] = PUPIL;
+      }
     }
   }
 }
@@ -311,6 +342,12 @@ void setup() {
   nextPupilCheckTime = millis() + PUPIL_CHECK_INTERVAL;
   nextHippusRetarget = millis() + random(800, 2000);
   nextBlinkTime = millis() + random(2000, 6000);
+
+  // Precompute the eye-tilt trig once - used by both the brightness map
+  // bake (angle offset) and every fillPupilSlit call (coordinate rotation).
+  eyeRotTheta = EYE_ROTATION_DEG * 3.14159265358979323846f / 180.0f;
+  eyeRotCos = cosf(eyeRotTheta);
+  eyeRotSin = sinf(eyeRotTheta);
 
   // Bake the iris shape once (per-pixel trig is too slow to repeat every
   // frame), then build the first working canvas at hue 0 (red).
