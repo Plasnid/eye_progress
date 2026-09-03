@@ -6,9 +6,13 @@
 // Arduino core variant (GPIO36/35/37), which Arduino_ESP32SPI picks up
 // automatically via the built-in SCK/MOSI/MISO constants. See the separate
 // pin connection listing for the full wiring table.
+//
+// TFT_RST lives on A3 rather than A2: with a LiIon/LiPoly Charger BFF
+// stacked underneath, A2 is claimed by the BFF's battery-voltage-monitor
+// divider, so it's left completely alone here.
 #define TFT_CS     18 // A0
 #define TFT_DC     17 // A1
-#define TFT_RST    9  // A2
+#define TFT_RST    8  // A3
 
 // Create the SPI bus instance and the GC9D01 display panel instance
 Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, SCK, MOSI, MISO);
@@ -334,9 +338,10 @@ void setup() {
   // Paint the permanent black eyeball background once
   display->fillCircle(CENTER_X, CENTER_Y, SCLERA_RADIUS, SCLERA);
 
-  // A3 is used (rather than A0) since A0 is GPIO18 - the same pin as
-  // TFT_CS above; reading it here would collide with the display wiring.
-  randomSeed(analogRead(A3));
+  // TX (GPIO5) is used for the seed noise read: A0/A1 are claimed by the
+  // display (CS/DC), A2 is reserved for the Charger BFF's battery monitor,
+  // and A3 is now TFT_RST - TX is the nearest still-genuinely-free pin.
+  randomSeed(analogRead(TX));
 
   // First dice-roll for a pupil event happens after one full check interval
   nextPupilCheckTime = millis() + PUPIL_CHECK_INTERVAL;
